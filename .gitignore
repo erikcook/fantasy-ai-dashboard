@@ -5,3 +5,4 @@ __pycache__/
 vvenv/
 .venv/
 .DS_Store
+.streamlit/secrets.toml.txt

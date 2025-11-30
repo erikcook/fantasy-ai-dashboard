@@ -4,690 +4,448 @@ import pandas as pd
 import google.generativeai as genai
 import datetime
 import nflreadpy as nfl
+import sqlite3
+
+# --- 1. Database Setup ---
+DATABASE_NAME = "fantasy_predictions.db"
+
+def init_db():
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS predictions")
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                week INTEGER,
+                matchup_id TEXT,
+                manager TEXT,
+                opponent TEXT,
+                ai_analysis TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+
+def save_prediction(week, matchup_id, manager, opponent, ai_analysis):
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO predictions (week, matchup_id, manager, opponent, ai_analysis)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (week, matchup_id, manager, opponent, ai_analysis))
+        conn.commit()
+
+init_db()
+
+# --- 2. Sidebar & Settings ---
+st.sidebar.title("NEXXT Fantasy")
+st.sidebar.markdown("### Version: 7.1 (Ordered Fix)")
+
+if st.sidebar.button("🔄 Refresh Data"):
+    st.cache_data.clear()
+    st.rerun()
 
 if 'data_health' not in st.session_state:
     st.session_state.data_health = {'Sleeper API': 'Pending', 'NFL Play-by-Play': 'Pending', 'Next Gen Stats': 'Pending'}
 
 league_id = st.sidebar.text_input('League ID', '1217902363445043200')
 
-# Secrets Handling for Google API Key
 if "GOOGLE_API_KEY" in st.secrets:
     google_api_key = st.secrets["GOOGLE_API_KEY"]
-    st.sidebar.success("Google API Key loaded from secrets!")
+    st.sidebar.success("AI Key Loaded")
 else:
     google_api_key = st.sidebar.text_input('Google API Key', type='password')
 
 if google_api_key:
     try:
         genai.configure(api_key=google_api_key)
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        st.sidebar.expander("Available Models").write(models)
     except Exception as e:
         st.sidebar.error(f"Key Error: {e}")
 
-# System Status Display - Replaced with Placeholder for Lazy Sidebar Fix
 status_placeholder = st.sidebar.empty()
 
-def get_league_users(league_id):
-    url = f"https://api.sleeper.app/v1/league/{league_id}/users"
-    response = requests.get(url)
-    return response.json()
-
-def get_league_rosters(league_id):
-    url = f"https://api.sleeper.app/v1/league/{league_id}/rosters"
-    response = requests.get(url)
-    return response.json()
-
-@st.cache_data
-def get_all_players():
-    url = "https://api.sleeper.app/v1/players/nfl"
-    response = requests.get(url)
-    return response.json()
-
-def get_current_week(league_id):
-    url = f"https://api.sleeper.app/v1/state/nfl"
-    response = requests.get(url)
-    return response.json()['week']
+# --- 3. Data Functions (Defined BEFORE use) ---
 
 def get_matchups(league_id, week):
-    url = f"https://api.sleeper.app/v1/league/{league_id}/matchups/{week}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        st.session_state.data_health['Sleeper API'] = '✅ Online'
-        return response.json()
-    else:
-        st.session_state.data_health['Sleeper API'] = '❌ Failed'
-        return []
+    try:
+        return requests.get(f"https://api.sleeper.app/v1/league/{league_id}/matchups/{week}").json()
+    except: return []
+
+def get_current_week(league_id):
+    return requests.get(f"https://api.sleeper.app/v1/state/nfl").json()['week']
+
+def get_league_users(league_id):
+    return requests.get(f"https://api.sleeper.app/v1/league/{league_id}/users").json()
+
+def get_league_rosters(league_id):
+    return requests.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters").json()
+
+@st.cache_data
+def get_all_players_v7():
+    """Loads Sleeper Player Database"""
+    try:
+        players_data = requests.get("https://api.sleeper.app/v1/players/nfl").json()
+        # Fix Defense Names
+        for p_id, p_data in players_data.items():
+            if p_data.get('position') == 'DEF':
+                team = p_data.get('team')
+                if team: players_data[p_id]['full_name'] = f"{team} Defense"
+        return players_data
+    except: return {}
 
 @st.cache_data
 def get_player_positions(all_players_data):
-    positions = {}
-    for player_id, player_data in all_players_data.items():
-        positions[player_id] = player_data.get('position', 'UNK')
-    return positions
+    """Extracts positions from player data"""
+    return {p_id: p_data.get('position', 'UNK') for p_id, p_data in all_players_data.items()}
+
+# --- 4. Advanced Data Functions ---
 
 @st.cache_data
-def get_ngs_data(season):
-    ngs_passing = pd.DataFrame()
-    ngs_rushing = pd.DataFrame()
-    ngs_receiving = pd.DataFrame()
+def get_ngs_data_v7(season):
     try:
-        ngs_passing = nfl.load_nextgen_stats(seasons=[season], stat_type='passing').to_pandas()
-        ngs_rushing = nfl.load_nextgen_stats(seasons=[season], stat_type='rushing').to_pandas()
-        ngs_receiving = nfl.load_nextgen_stats(seasons=[season], stat_type='receiving').to_pandas()
-
-        # Check for critical columns: player_display_name and week
-        for df, name in [(ngs_passing, 'passing'), (ngs_rushing, 'rushing'), (ngs_receiving, 'receiving')]:
-            if df.empty:
-                continue # If dataframe is empty, no need to check columns, it's valid empty
-            if not all(col in df.columns for col in ['player_display_name', 'week']):
-                # st.session_state.data_health['Next Gen Stats'] = f'❌ Failed (Missing columns in NGS {name} data)'
-                st.toast(f'Next Gen Stats {name} data failed to load due to missing columns.')
-                # Return empty dataframes for consistency
-                return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-        # st.session_state.data_health['Next Gen Stats'] = '✅ Online'
-        return ngs_passing, ngs_rushing, ngs_receiving
-    except Exception as e:
-        st.toast(f'Next Gen Stats failed to load: {e}. Using standard stats.')
-        # st.session_state.data_health['Next Gen Stats'] = '⚠️ Offline (Using Standard Stats)'
+        ngs_pass = nfl.load_nextgen_stats(seasons=[season], stat_type='passing').to_pandas()
+        ngs_rush = nfl.load_nextgen_stats(seasons=[season], stat_type='rushing').to_pandas()
+        ngs_rec = nfl.load_nextgen_stats(seasons=[season], stat_type='receiving').to_pandas()
+        
+        if not ngs_pass.empty:
+            if 'completion_percentage_above_expectation' in ngs_pass.columns:
+                ngs_pass.rename(columns={'completion_percentage_above_expectation': 'cpoe'}, inplace=True)
+            if 'avg_intended_air_yards' in ngs_pass.columns:
+                ngs_pass.rename(columns={'avg_intended_air_yards': 'air_yards'}, inplace=True)
+        
+        if not ngs_rush.empty:
+            if 'rush_yards_over_expected' in ngs_rush.columns:
+                ngs_rush.rename(columns={'rush_yards_over_expected': 'ryoe'}, inplace=True)
+        
+        if not ngs_rec.empty:
+            if 'avg_separation' in ngs_rec.columns:
+                ngs_rec.rename(columns={'avg_separation': 'avg_sep'}, inplace=True)
+        
+        st.session_state.data_health['Next Gen Stats'] = '✅ Online'
+        return ngs_pass, ngs_rush, ngs_rec
+    except Exception:
+        st.session_state.data_health['Next Gen Stats'] = '⚠️ Offline'
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 @st.cache_data
-def get_pbp_advanced_stats(season):
+def get_pbp_advanced_stats_v7(season):
     try:
         pbp_df = nfl.load_pbp(seasons=[season]).to_pandas()
         ids_df = nfl.load_ff_playerids().to_pandas()
-        # Fix for '0-Stats bug' (Brian Thomas Fix): Clean sleeper_id immediately after loading
         ids_df['sleeper_id'] = ids_df['sleeper_id'].astype(str).str.replace(r'\.0$', '', regex=True)
-
-        # Check for critical columns: epa, air_yards
-        if not all(col in pbp_df.columns for col in ['epa', 'passer_player_id']):
-            st.session_state.data_health['NFL Play-by-Play'] = '❌ Failed (Missing columns in Play-by-Play data)'
-            st.toast("Critical Error: 'epa' or 'air_yards' column not found in Play-by-Play data. Check nflreadpy version.")
-            return {}
         
-        # Filter for recent weeks in Play-by-Play data
-        max_week_pbp = pbp_df['week'].max() if not pbp_df.empty else 0
-        pbp_filtered_df = pbp_df[pbp_df['week'] >= max_week_pbp - 2]
+        if pbp_df.empty: return {}
 
+        max_week = pbp_df['week'].max()
+        pbp_df = pbp_df[pbp_df['week'] >= max_week - 2]
+        
         advanced_stats = {}
 
-        # QB Stats (EPA & Air Yards)
-        if not pbp_filtered_df.empty:
-            qb_stats = pbp_filtered_df.groupby('passer_player_id').agg(
-                avg_epa=('epa', 'mean'),
+        # 1. QB EPA
+        if 'epa' in pbp_df.columns:
+            qb_stats = pbp_df.groupby('passer_player_id')['epa'].mean().reset_index()
+            merged = qb_stats.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='passer_player_id', right_on='gsis_id')
+            for _, row in merged.iterrows():
+                advanced_stats[row['sleeper_id']] = {'epa': row['epa']}
+
+        # 2. RB Red Zone
+        rz_df = pbp_df[(pbp_df['yardline_100'] <= 20) & (pbp_df['play_type'].isin(['run', 'pass']))]
+        if not rz_df.empty:
+            rz_counts = rz_df.assign(pid=rz_df['rusher_player_id'].fillna(rz_df['receiver_player_id']))
+            rz_counts = rz_counts.groupby('pid').size().reset_index(name='rz_touches')
+            merged = rz_counts.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='pid', right_on='gsis_id')
+            for _, row in merged.iterrows():
+                if row['sleeper_id'] not in advanced_stats: advanced_stats[row['sleeper_id']] = {}
+                advanced_stats[row['sleeper_id']]['rz_touches'] = row['rz_touches']
+
+        # 3. WR/TE WOPR Proxy
+        wr_df = pbp_df[pbp_df['play_type'] == 'pass'].groupby('receiver_player_id').agg(
+            targets=('play_id', 'count'),
+            air_yards=('air_yards', 'sum'),
+            avg_epa=('epa', 'mean')
+        ).reset_index()
+        wr_df['wopr_proxy'] = 1.5 * wr_df['targets'] + 0.07 * wr_df['air_yards']
+        merged = wr_df.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='receiver_player_id', right_on='gsis_id')
+        for _, row in merged.iterrows():
+             if row['sleeper_id'] not in advanced_stats: advanced_stats[row['sleeper_id']] = {}
+             advanced_stats[row['sleeper_id']].update({'wopr_proxy': row['wopr_proxy'], 'pbp_epa': row['avg_epa']})
+
+        # 4. Defense (EPA Allowed)
+        if 'defteam' in pbp_df.columns:
+            def_df = pbp_df.groupby('defteam').agg(
+                epa_allowed=('epa', 'mean'),
+                sacks=('sack', 'sum') if 'sack' in pbp_df.columns else ('sack_qb', 'sum'),
+                pass_att=('pass_attempt', 'sum')
             ).reset_index()
-            merged_qb = qb_stats.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='passer_player_id', right_on='gsis_id', how='inner')
-            for _, row in merged_qb.iterrows():
-                advanced_stats[row['sleeper_id']] = {'epa': row['avg_epa']}
+            
+            # Normalize column name
+            if 'sack' in def_df.columns: def_df.rename(columns={'sack': 'sacks'}, inplace=True)
+            elif 'sack_qb' in def_df.columns: def_df.rename(columns={'sack_qb': 'sacks'}, inplace=True)
 
-        # Add RB Logic (Red Zone Touches)
-        if not pbp_filtered_df.empty:
-            rz_pbp_df = pbp_filtered_df[pbp_filtered_df['yardline_100'] <= 20]
-            if not rz_pbp_df.empty:
-                # Count red zone opportunities
-                rz_opportunities = []
-                for _, play in rz_pbp_df.iterrows():
-                    if play['play_type'] == 'run' and play['rusher_player_id']:
-                        rz_opportunities.append({'player_id': play['rusher_player_id'], 'rz_touch': 1})
-                    elif play['play_type'] == 'pass' and play['receiver_player_id']:
-                        rz_opportunities.append({'player_id': play['receiver_player_id'], 'rz_touch': 1})
-                
-                if rz_opportunities:
-                    rz_df = pd.DataFrame(rz_opportunities)
-                    rb_rz_stats = rz_df.groupby('player_id').agg(
-                        rz_touches=('rz_touch', 'sum')
-                    ).reset_index()
-                    merged_rb_rz = rb_rz_stats.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='player_id', right_on='gsis_id', how='inner')
-                    for _, row in merged_rb_rz.iterrows():
-                        if row['sleeper_id'] in advanced_stats:
-                            advanced_stats[row['sleeper_id']]['rz_touches'] = row['rz_touches']
-                        else:
-                            advanced_stats[row['sleeper_id']] = {'rz_touches': row['rz_touches']}
+            def_df['sack_rate'] = def_df['sacks'] / def_df['pass_att']
+            
+            for _, row in def_df.iterrows():
+                team = row['defteam']
+                stats = {'epa_allowed': row['epa_allowed'], 'sack_rate': row['sack_rate'], 'sacks_pbp': row['sacks']}
+                advanced_stats[team] = stats
+                if team == 'JAX': advanced_stats['JAC'] = stats
+                if team == 'WAS': advanced_stats['WSH'] = stats
 
-        # Add WR/TE Logic (WOPR_Proxy)
-        if not pbp_filtered_df.empty:
-            wr_te_pbp_df = pbp_filtered_df[pbp_filtered_df['play_type'] == 'pass'][['receiver_player_id', 'play_id', 'air_yards', 'epa']].dropna(subset=['receiver_player_id'])
-            if not wr_te_pbp_df.empty:
-                wr_te_stats_pbp = wr_te_pbp_df.groupby('receiver_player_id').agg(
-                    targets=('play_id', 'count'),
-                    total_air_yards=('air_yards', 'sum'),
-                    avg_epa=('epa', 'mean')
-                ).reset_index()
+        # 5. Kicker
+        if 'field_goal_attempt' in pbp_df.columns:
+            k_df = pbp_df[pbp_df['field_goal_attempt'] == 1].groupby('kicker_player_id').agg(
+                made=('field_goal_result', lambda x: (x=='made').sum()),
+                atts=('play_id', 'count'),
+                long=('kick_distance', lambda x: x[pbp_df['field_goal_result']=='made'].max())
+            ).reset_index()
+            k_df['fg_pct'] = (k_df['made'] / k_df['atts']) * 100
+            merged = k_df.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='kicker_player_id', right_on='gsis_id')
+            for _, row in merged.iterrows():
+                 if row['sleeper_id'] not in advanced_stats: advanced_stats[row['sleeper_id']] = {}
+                 advanced_stats[row['sleeper_id']].update({'fg_percentage': row['fg_pct'], 'longest_fg_made': row['long']})
 
-                # Calculate WOPR_Proxy
-                wr_te_stats_pbp['wopr_proxy'] = 1.5 * wr_te_stats_pbp['targets'] + 0.7 * (wr_te_stats_pbp['total_air_yards'] / 10)
-                wr_te_stats_pbp.rename(columns={'receiver_player_id': 'player_id'}, inplace=True)
-                merged_wr_te_pbp = wr_te_stats_pbp.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='player_id', right_on='gsis_id', how='inner')
-
-                for _, row in merged_wr_te_pbp.iterrows():
-                    if row['sleeper_id'] in advanced_stats:
-                        advanced_stats[row['sleeper_id']].update({
-                            'wopr_proxy': row['wopr_proxy'],
-                            'pbp_epa': row['avg_epa'] # Store PBP EPA separately for WR/TE if needed
-                        })
-                    else:
-                        advanced_stats[row['sleeper_id']] = {
-                            'wopr_proxy': row['wopr_proxy'],
-                            'pbp_epa': row['avg_epa']
-                        }
-
-        # st.session_state.data_health['NFL Play-by-Play'] = '✅ Online'
+        st.session_state.data_health['NFL Play-by-Play'] = '✅ Online'
         return advanced_stats
-
     except Exception as e:
-        st.toast(f'NFL Play-by-Play data failed to load: {e}. Using standard stats.')
-        # st.session_state.data_health['NFL Play-by-Play'] = '❌ Failed'
+        st.session_state.data_health['NFL Play-by-Play'] = f'❌ Failed: {e}'
         return {}
-
 
 @st.cache_data
-def get_volume_stats_v2(current_week):
-    stats_df = nfl.load_player_stats(seasons=[2025]).to_pandas()
-    ids_df = nfl.load_ff_playerids().to_pandas()
+def get_volume_stats_v7(current_week):
+    """Fetches Volume and Team Stats"""
+    # 1. Load Player Stats
+    try:
+        stats_df = nfl.load_player_stats(seasons=[2025]).to_pandas()
+        ids_df = nfl.load_ff_playerids().to_pandas()
+        
+        if 'player_position' in stats_df.columns: stats_df.rename(columns={'player_position': 'position'}, inplace=True)
+        elif 'position' not in stats_df.columns: stats_df['position'] = 'UNK'
 
-    merged_df = stats_df.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='player_id', right_on='gsis_id', how='inner')
+        merged = stats_df.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='player_id', right_on='gsis_id', how='inner')
+        merged['sleeper_id'] = merged['sleeper_id'].astype(str).str.replace(r'\.0$', '', regex=True)
 
-    # Force sleeper_id to be string and clean float-like strings
-    merged_df['sleeper_id'] = merged_df['sleeper_id'].astype(str).str.replace(r'\.0$', '', regex=True)
+        # SAFE COLUMNS ONLY
+        cols = ['sleeper_id', 'week', 'targets', 'carries', 'attempts', 'fantasy_points_ppr', 'position']
+        valid_cols = [c for c in cols if c in merged.columns]
+        merged = merged[valid_cols].copy()
+        
+        for c in cols:
+            if c not in merged.columns: merged[c] = 0
+            else: merged[c] = merged[c].fillna(0)
 
-    columns_to_keep = ['sleeper_id', 'week', 'targets', 'carries', 'attempts', 'fantasy_points_ppr']
-    
-    # Check for critical columns and set status
-    missing_cols = [col for col in columns_to_keep if col not in merged_df.columns]
-    if missing_cols:
-        # st.session_state.data_health['NFL Play-by-Play'] = f'❌ Failed (Missing columns in Volume stats: {", ".join(missing_cols)})'
-        return {}
+        # Simple Volume Calc (Offense Only)
+        merged['vol'] = merged['targets'] + merged['carries'] + merged['attempts']
+        
+        max_week = merged['week'].max()
+        merged = merged[merged['week'] >= max_week - 2]
+        
+        final_stats = {}
+        for sid, group in merged.groupby('sleeper_id'):
+            pos = group['position'].iloc[0] if 'position' in group.columns else 'UNK'
+            final_stats[sid] = {'vol': group['vol'].mean(), 'avg_pts': group['fantasy_points_ppr'].mean(), 'position': pos}
+    except:
+        final_stats = {}
 
-    merged_df = merged_df[columns_to_keep]
+    # 2. Load Team Stats (Defenses Backup)
+    try:
+        team_df = nfl.load_team_stats(seasons=[2025]).to_pandas()
+        if not team_df.empty:
+            max_t = team_df['week'].max()
+            team_df = team_df[team_df['week'] >= max_t - 2].copy()
+            
+            num_cols = ['sacks', 'interceptions', 'fumbles_recovered', 'fantasy_points_ppr']
+            # Ensure exists
+            for c in num_cols: 
+                if c not in team_df.columns: team_df[c] = 0
+            
+            grouped = team_df.groupby('team')[num_cols].mean()
+            
+            for team, row in grouped.iterrows():
+                vol = row['sacks'] + row['interceptions'] + row['fumbles_recovered']
+                stats = {'vol': vol, 'avg_pts': row['fantasy_points_ppr'], 'position': 'DEF'}
+                final_stats[team] = stats
+                if team == 'JAX': final_stats['JAC'] = stats
+                if team == 'WAS': final_stats['WSH'] = stats
+                
+        st.session_state.data_health['Volume Stats'] = "✅ Online"
+        return final_stats
+    except Exception as e:
+        st.session_state.data_health['Volume Stats'] = f"❌ Failed: {e}"
+        return final_stats
 
-    for col in ['targets', 'carries', 'attempts', 'fantasy_points_ppr']:
-        merged_df[col] = merged_df[col].fillna(0)
-
-    merged_df['opportunity'] = merged_df['targets'] + merged_df['carries'] + merged_df['attempts']
-
-    max_week = merged_df['week'].max()
-    filtered_df = merged_df[merged_df['week'] >= max_week - 2]
-
-    grouped_stats = filtered_df.groupby('sleeper_id').agg(
-        avg_vol=('opportunity', 'mean'),
-        avg_pts=('fantasy_points_ppr', 'mean'),
-        avg_pass_attempts=('attempts', 'mean'),
-        avg_rush_targets=('targets', 'mean'),
-        avg_carries=('carries', 'mean')
-    ).to_dict(orient='index')
-    
-    # Reformat to {sleeper_id: {'vol': avg_vol, 'avg_pts': avg_pts, 'pass': avg_pass, 'rush': avg_rush}}
-    formatted_stats = {}
-    for s_id, data in grouped_stats.items():
-        formatted_stats[s_id] = {
-            'vol': data['avg_vol'],
-            'avg_pts': data['avg_pts'],
-            'pass': data['avg_pass_attempts'],
-            'rush': data['avg_rush_targets'] + data['avg_carries']
-        }
-
-    print("Sample Keys:", list(formatted_stats.keys())[:5]) # Debug Helper
-    # st.session_state.data_health['NFL Play-by-Play'] = '✅ Online'
-
-    return formatted_stats
-
+# --- 5. Main App Logic ---
 if league_id:
-    st.write(f"Fetching users for League ID: {league_id}")
-    users_data = get_league_users(league_id)
-    rosters_data = get_league_rosters(league_id)
+    # Load Data First
+    col_a, col_b, col_c = st.columns(3)
+    with col_a: 
+        vol_stats = get_volume_stats_v7(13)
+        st.caption(f"Vol: {st.session_state.data_health.get('Volume Stats', 'Pending')}")
+    with col_b: 
+        pbp_stats = get_pbp_advanced_stats_v7(2025)
+        st.caption(f"PBP: {st.session_state.data_health.get('NFL Play-by-Play', 'Pending')}")
+    with col_c: 
+        ngs_pass, ngs_rush, ngs_rec = get_ngs_data_v7(2025)
+        st.caption(f"NGS: {st.session_state.data_health.get('Next Gen Stats', 'Pending')}")
 
-    # Create a mapping from user_id to display_name
-    user_name_map = {user['user_id']: user['display_name'] for user in users_data}
-
-    # Prepare data for DataFrame
-    leaderboard_data = []
-    for roster in rosters_data:
-        owner_id = roster['owner_id']
-        manager_name = user_name_map.get(owner_id, "Unknown Manager")
-        wins = roster['settings']['wins']
-        losses = roster['settings']['losses']
-        total_fpts = roster['settings']['fpts']
-        leaderboard_data.append({
-            'Manager Name': manager_name,
-            'Wins': wins,
-            'Losses': losses,
-            'Total FPTS': total_fpts
-        })
-
-    # Create DataFrame
-    df = pd.DataFrame(leaderboard_data)
-
-    # Sort by Total FPTS for leaderboard effect
-    df = df.sort_values(by='Total FPTS', ascending=False).reset_index(drop=True)
-
-    st.dataframe(df)
-
-    current_week = get_current_week(league_id)
-    st.write(f"## Week {current_week} Matchups")
-
-    all_players = get_all_players()
-    player_id_to_name = {player_id: player_data['full_name'] for player_id, player_data in all_players.items() if 'full_name' in player_data}
-    player_positions = get_player_positions(all_players)
-
-    # Fetch and update status for Volume Stats
-    volume_stats_data = get_volume_stats_v2(current_week)
-    if volume_stats_data:
-        st.session_state.data_health['NFL Play-by-Play'] = '✅ Online'
-    else:
-        st.session_state.data_health['NFL Play-by-Play'] = '❌ Failed'
-
-    # Fetch and update status for NGS Data
-    ngs_passing_raw, ngs_rushing_raw, ngs_receiving_raw = get_ngs_data(season=2025)
-    if not ngs_passing_raw.empty or not ngs_rushing_raw.empty or not ngs_receiving_raw.empty:
-        st.session_state.data_health['Next Gen Stats'] = '✅ Online'
-    else:
-        st.session_state.data_health['Next Gen Stats'] = '⚠️ Offline (Using Standard Stats)'
-
-    # Fetch and update status for Play-by-Play Advanced Stats
-    pbp_advanced_stats = get_pbp_advanced_stats(season=2025)
-    if pbp_advanced_stats:
-        st.session_state.data_health['NFL Play-by-Play'] = '✅ Online'
-    else:
-        st.session_state.data_health['NFL Play-by-Play'] = '❌ Failed'
-
-    # Calculate NGS stats from raw dataframes and merge them
-    ngs_advanced_stats = {}
-    ids_df = nfl.load_ff_playerids().to_pandas()
-    # Apply ID cleaning to ids_df in the main block too
-    ids_df['sleeper_id'] = ids_df['sleeper_id'].astype(str).str.replace(r'\.0$', '', regex=True)
-    ids_df['gsis_id'] = ids_df['gsis_id'].astype(str).str.replace(r'\.0$', '', regex=True)
-
-    if not ngs_passing_raw.empty:
-        latest_week_passing = ngs_passing_raw['week'].max() if not ngs_passing_raw.empty else 0
-        ngs_passing_filtered = ngs_passing_raw[ngs_passing_raw['week'] == latest_week_passing]
-        if not ngs_passing_filtered.empty and 'cpoe' in ngs_passing_filtered.columns and 'air_yards' in ngs_passing_filtered.columns:
-            qb_stats_ngs = ngs_passing_filtered.groupby('player_gsis_id').agg(
-                avg_cpoe=('cpoe', 'mean'),
-                sum_air_yards_ngs=('air_yards', 'sum')
-            ).reset_index()
-            merged_qb_ngs = qb_stats_ngs.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='player_gsis_id', right_on='gsis_id', how='inner')
-            for _, row in merged_qb_ngs.iterrows():
-                ngs_advanced_stats[row['sleeper_id']] = {'cpoe': row['avg_cpoe'], 'air_yards': row['sum_air_yards_ngs']}
-
-    if not ngs_rushing_raw.empty:
-        latest_week_rushing = ngs_rushing_raw['week'].max() if not ngs_rushing_raw.empty else 0
-        ngs_rushing_filtered = ngs_rushing_raw[ngs_rushing_raw['week'] == latest_week_rushing]
-        if not ngs_rushing_filtered.empty and 'rush_yards_over_expected' in ngs_rushing_filtered.columns:
-            rb_stats_ngs = ngs_rushing_filtered.groupby('player_gsis_id').agg(
-                avg_ryoe=('rush_yards_over_expected', 'mean'),
-            ).reset_index()
-            merged_rb_ngs = rb_stats_ngs.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='player_gsis_id', right_on='gsis_id', how='inner')
-            for _, row in merged_rb_ngs.iterrows():
-                if row['sleeper_id'] in ngs_advanced_stats:
-                    ngs_advanced_stats[row['sleeper_id']]['ryoe'] = row['avg_ryoe']
-                else:
-                    ngs_advanced_stats[row['sleeper_id']] = {'ryoe': row['avg_ryoe']}
+    # THEN Load Sleeper
+    users = get_league_users(league_id)
+    rosters = get_league_rosters(league_id)
+    user_map = {u['user_id']: u['display_name'] for u in users}
+    roster_owner_map = {r['roster_id']: r['owner_id'] for r in rosters}
     
-    if not ngs_receiving_raw.empty:
-        latest_week_receiving = ngs_receiving_raw['week'].max() if not ngs_receiving_raw.empty else 0
-        ngs_receiving_filtered = ngs_receiving_raw[ngs_receiving_raw['week'] == latest_week_receiving]
-        if not ngs_receiving_filtered.empty and 'targets' in ngs_receiving_filtered.columns and 'air_yards' in ngs_receiving_filtered.columns and 'avg_separation' in ngs_receiving_filtered.columns:
-            wr_te_stats_ngs = ngs_receiving_filtered.groupby('player_gsis_id').agg(
-                avg_separation=('avg_separation', 'mean'),
-            ).reset_index()
+    # FIX: Correct function call
+    all_players = get_all_players_v7()
+    player_positions = get_player_positions(all_players)
+    curr_week = get_current_week(league_id)
 
-            merged_wr_te_ngs = wr_te_stats_ngs.merge(ids_df[['gsis_id', 'sleeper_id']], left_on='player_gsis_id', right_on='gsis_id', how='inner')
-            for _, row in merged_wr_te_ngs.iterrows():
-                if row['sleeper_id'] in ngs_advanced_stats:
-                    ngs_advanced_stats[row['sleeper_id']].update({
-                        'avg_separation': row['avg_separation']
-                    })
-                else:
-                    ngs_advanced_stats[row['sleeper_id']] = {
-                        'avg_separation': row['avg_separation']
-                    }
+    # Process NGS
+    ngs_stats = {}
+    ids = nfl.load_ff_playerids().to_pandas()
+    ids['sleeper_id'] = ids['sleeper_id'].astype(str).str.replace(r'\.0$', '', regex=True)
+    ids['gsis_id'] = ids['gsis_id'].astype(str).str.replace(r'\.0$', '', regex=True)
 
-    # Merge all advanced stats
-    merged_player_stats = {}
-    all_player_ids = set(volume_stats_data.keys()).union(set(pbp_advanced_stats.keys())).union(set(ngs_advanced_stats.keys()))
+    if not ngs_pass.empty:
+        latest = ngs_pass[ngs_pass['week'] == ngs_pass['week'].max()]
+        if 'cpoe' in latest.columns:
+            merged = latest.merge(ids[['gsis_id', 'sleeper_id']], left_on='player_gsis_id', right_on='gsis_id')
+            for _, row in merged.iterrows():
+                ngs_stats[row['sleeper_id']] = {'cpoe': row['cpoe'], 'air_yards': row.get('air_yards', 0)}
+    
+    if not ngs_rush.empty:
+        latest = ngs_rush[ngs_rush['week'] == ngs_rush['week'].max()]
+        merged = latest.merge(ids[['gsis_id', 'sleeper_id']], left_on='player_gsis_id', right_on='gsis_id')
+        for _, row in merged.iterrows():
+            if row['sleeper_id'] not in ngs_stats: ngs_stats[row['sleeper_id']] = {}
+            if 'ryoe' in row: ngs_stats[row['sleeper_id']]['ryoe'] = row['ryoe']
 
-    for p_id in all_player_ids:
-        merged_player_stats[p_id] = {}
-        if p_id in volume_stats_data:
-            merged_player_stats[p_id].update(volume_stats_data[p_id])
-        if p_id in pbp_advanced_stats:
-            merged_player_stats[p_id].update(pbp_advanced_stats[p_id]) # pbp_advanced_stats now contains rz_touches
-        if p_id in ngs_advanced_stats:
-            merged_player_stats[p_id].update(ngs_advanced_stats[p_id]) # ngs_advanced_stats contains wopr, target_share, etc.
+    if not ngs_rec.empty:
+        latest = ngs_rec[ngs_rec['week'] == ngs_rec['week'].max()]
+        merged = latest.merge(ids[['gsis_id', 'sleeper_id']], left_on='player_gsis_id', right_on='gsis_id')
+        for _, row in merged.iterrows():
+             if row['sleeper_id'] not in ngs_stats: ngs_stats[row['sleeper_id']] = {}
+             if 'avg_sep' in row: ngs_stats[row['sleeper_id']]['avg_sep'] = row['avg_sep']
 
-    matchups_data = get_matchups(league_id, current_week)
+    # Master Merge
+    master_stats = {}
+    all_ids = set(vol_stats.keys()) | set(pbp_stats.keys()) | set(ngs_stats.keys())
+    for i in all_ids:
+        master_stats[i] = {}
+        if i in vol_stats: master_stats[i].update(vol_stats[i])
+        if i in pbp_stats: master_stats[i].update(pbp_stats[i])
+        if i in ngs_stats: master_stats[i].update(ngs_stats[i])
 
-    # Group matchups by matchup_id
-    matchup_groups = {}
-    for matchup in matchups_data:
-        matchup_id = matchup['matchup_id']
-        if matchup_id not in matchup_groups:
-            matchup_groups[matchup_id] = []
-        matchup_groups[matchup_id].append(matchup)
+    st.write(f"### Week {curr_week} Matchups")
+    matchups = get_matchups(league_id, curr_week)
+    
+    games = {}
+    for m in matchups:
+        if m['matchup_id'] not in games: games[m['matchup_id']] = []
+        games[m['matchup_id']].append(m)
 
-    for matchup_id, teams in matchup_groups.items():
-        if len(teams) == 2:
-            col1, col2 = st.columns(2)
-            team_a = teams[0]
-            team_b = teams[1]
+    for mid, teams in games.items():
+        if len(teams) != 2: continue
+        col1, col2 = st.columns(2)
+        prompt_data = []
+        
+        for i, (col, team) in enumerate(zip([col1, col2], teams)):
+            with col:
+                rid = team['roster_id']
+                oid = roster_owner_map.get(rid)
+                manager = user_map.get(oid, 'Unknown')
+                st.write(f"**{manager}**")
+                
+                starters = team['starters']
+                roster_players = next((r['players'] for r in rosters if r['roster_id'] == rid), [])
+                bench = list(set(roster_players) - set(starters))
+                team_text = f"Manager: {manager}\n"
 
-            with col1:
-                roster_id = team_a['roster_id']
-                manager_a_name = "Unknown Manager"
-                for user in users_data:
-                    for roster in rosters_data:
-                        if roster['roster_id'] == roster_id and roster['owner_id'] == user['user_id']:
-                            manager_a_name = user['display_name']
-                            break
-                    if manager_a_name != "Unknown Manager":
-                        break
-                st.write(f"### {manager_a_name}")
-                st.write("**Starters:**")
-                for player_id in team_a['starters']:
-                    clean_id = str(player_id).replace('.0', '')
-                    player_stats = merged_player_stats.get(clean_id, {'vol': 0, 'avg_pts': 0, 'pass': 0, 'rush': 0, 'epa': 0, 'cpoe': 0, 'air_yards': 0, 'ryoe': 0, 'rz_touches': 0, 'wopr_proxy': 0, 'pbp_epa': 0, 'avg_separation': 0})
-                    volume_val = player_stats['vol']
-                    avg_pts_val = player_stats['avg_pts']
-                    actual_pts = team_a['players_points'].get(player_id, 0)
-                    position = player_positions.get(clean_id, 'UNK')
-
-                    player_name_display = player_id_to_name.get(player_id, f'Player {player_id}')
-
-                    # 'Pro' View Display Logic (Relaxed Conditions)
-                    show_advanced_stats = False
-                    if position == 'QB' and ('epa' in player_stats or 'cpoe' in player_stats or 'air_yards' in player_stats):
-                        epa_str = f"EPA: {round(player_stats['epa'], 2)}" if 'epa' in player_stats and player_stats['epa'] is not None else ""
-                        cpoe_str = f"CPOE: {round(player_stats['cpoe'], 2)}%" if 'cpoe' in player_stats and player_stats['cpoe'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [epa_str, cpoe_str, vol_str]))
-                        if display_parts:
-                            st.write(f"**{player_name_display}** ({" | ".join(display_parts)})")
-                            show_advanced_stats = True
-                    elif position == 'RB' and ('ryoe' in player_stats or 'rz_touches' in player_stats):
-                        ryoe_str = f"RYOE: {round(player_stats['ryoe'], 1)}" if 'ryoe' in player_stats and player_stats['ryoe'] is not None else ""
-                        rz_str = f"RZ: {player_stats['rz_touches']:.0f}" if 'rz_touches' in player_stats and player_stats['rz_touches'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [ryoe_str, rz_str, vol_str]))
-                        if display_parts:
-                            st.write(f"**{player_name_display}** ({" | ".join(display_parts)})")
-                            show_advanced_stats = True
-                    elif position in ['WR', 'TE'] and ('wopr_proxy' in player_stats or 'pbp_epa' in player_stats or 'avg_separation' in player_stats):
-                        wopr_str = f"WOPR: {round(player_stats['wopr_proxy'], 2)}" if 'wopr_proxy' in player_stats and player_stats['wopr_proxy'] is not None else ""
-                        epa_str = f"EPA: {round(player_stats['pbp_epa'], 2)}" if 'pbp_epa' in player_stats and player_stats['pbp_epa'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [wopr_str, epa_str, vol_str]))
-                        if display_parts:
-                            st.write(f"**{player_name_display}** ({" | ".join(display_parts)})")
-                            show_advanced_stats = True
+                for grp, p_ids in [("Starters", starters), ("Bench", bench)]:
+                    if grp == "Bench": 
+                        st.markdown("---")
+                        st.caption("Bench")
                     
-                    if not show_advanced_stats: # Fallback to old format if advanced stats not displayed
-                        actual_pts_display = f":green[{actual_pts:.1f}]" if actual_pts > avg_pts_val else f"{actual_pts:.1f}"
-                        st.write(f"**{player_name_display}** (Vol: {volume_val:.1f} | Avg: {avg_pts_val:.1f} | Act: {actual_pts_display})")
-
-                # Calculate and display bench players for Team A
-                st.markdown("<!-- -->") # Divider
-                st.write("**Bench:**")
-                team_a_roster = next((r['players'] for r in rosters_data if r['roster_id'] == roster_id), [])
-                team_a_bench_players = [p_id for p_id in team_a_roster if p_id not in team_a['starters']]
-                for player_id in team_a_bench_players:
-                    clean_id = str(player_id).replace('.0', '')
-                    player_stats = merged_player_stats.get(clean_id, {'vol': 0, 'avg_pts': 0, 'pass': 0, 'rush': 0, 'epa': 0, 'cpoe': 0, 'air_yards': 0, 'ryoe': 0, 'rz_touches': 0, 'wopr_proxy': 0, 'pbp_epa': 0, 'avg_separation': 0})
-                    volume_val = player_stats['vol']
-                    avg_pts_val = player_stats['avg_pts']
-                    actual_pts = team_a['players_points'].get(player_id, 0)
-                    position = player_positions.get(clean_id, 'UNK')
-
-                    player_name_display = player_id_to_name.get(player_id, f'Player {player_id}')
-
-                    show_advanced_stats_bench = False
-                    if position == 'QB' and ('epa' in player_stats or 'cpoe' in player_stats or 'air_yards' in player_stats):
-                        epa_str = f"EPA: {round(player_stats['epa'], 2)}" if 'epa' in player_stats and player_stats['epa'] is not None else ""
-                        cpoe_str = f"CPOE: {round(player_stats['cpoe'], 2)}%" if 'cpoe' in player_stats and player_stats['cpoe'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [epa_str, cpoe_str, vol_str]))
-                        if display_parts:
-                            st.markdown(f"<small>**{player_name_display}** ({" | ".join(display_parts)})</small>", unsafe_allow_html=True)
-                            show_advanced_stats_bench = True
-                    elif position == 'RB' and ('ryoe' in player_stats or 'rz_touches' in player_stats):
-                        ryoe_str = f"RYOE: {round(player_stats['ryoe'], 1)}" if 'ryoe' in player_stats and player_stats['ryoe'] is not None else ""
-                        rz_str = f"RZ: {player_stats['rz_touches']:.0f}" if 'rz_touches' in player_stats and player_stats['rz_touches'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [ryoe_str, rz_str, vol_str]))
-                        if display_parts:
-                            st.markdown(f"<small>**{player_name_display}** ({" | ".join(display_parts)})</small>", unsafe_allow_html=True)
-                            show_advanced_stats_bench = True
-                    elif position in ['WR', 'TE'] and ('wopr_proxy' in player_stats or 'pbp_epa' in player_stats or 'avg_separation' in player_stats):
-                        wopr_str = f"WOPR: {round(player_stats['wopr_proxy'], 2)}" if 'wopr_proxy' in player_stats and player_stats['wopr_proxy'] is not None else ""
-                        epa_str = f"EPA: {round(player_stats['pbp_epa'], 2)}" if 'pbp_epa' in player_stats and player_stats['pbp_epa'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [wopr_str, epa_str, vol_str]))
-                        if display_parts:
-                            st.markdown(f"<small>**{player_name_display}** ({" | ".join(display_parts)})</small>", unsafe_allow_html=True)
-                            show_advanced_stats_bench = True
-                    
-                    if not show_advanced_stats_bench: # Fallback to old format if advanced stats not displayed
-                        st.markdown(f"<small>**{player_id_to_name.get(player_id, f'Player {player_id}')}** (Vol: {volume_val:.1f} | Avg: {avg_pts_val:.1f} | Act: {actual_pts:.1f})</small>", unsafe_allow_html=True)
-
-            with col2:
-                roster_b_id = team_b['roster_id']
-                manager_b_name = "Unknown Manager"
-                for user in users_data:
-                    for roster in rosters_data:
-                        if roster['roster_id'] == roster_b_id and roster['owner_id'] == user['user_id']:
-                            manager_b_name = user['display_name']
-                            break
-                    if manager_b_name != "Unknown Manager":
-                        break
-                st.write(f"### {manager_b_name}")
-                st.write("**Starters:**")
-                for player_id in team_b['starters']:
-                    clean_id = str(player_id).replace('.0', '')
-                    player_stats = merged_player_stats.get(clean_id, {'vol': 0, 'avg_pts': 0, 'pass': 0, 'rush': 0, 'epa': 0, 'cpoe': 0, 'air_yards': 0, 'ryoe': 0, 'rz_touches': 0, 'wopr_proxy': 0, 'pbp_epa': 0, 'avg_separation': 0})
-                    volume_val = player_stats['vol']
-                    avg_pts_val = player_stats['avg_pts']
-                    actual_pts = team_b['players_points'].get(player_id, 0)
-                    position = player_positions.get(clean_id, 'UNK')
-
-                    player_name_display = player_id_to_name.get(player_id, f'Player {player_id}')
-
-                    # 'Pro' View Display Logic (Relaxed Conditions)
-                    show_advanced_stats = False
-                    if position == 'QB' and ('epa' in player_stats or 'cpoe' in player_stats or 'air_yards' in player_stats):
-                        epa_str = f"EPA: {round(player_stats['epa'], 2)}" if 'epa' in player_stats and player_stats['epa'] is not None else ""
-                        cpoe_str = f"CPOE: {round(player_stats['cpoe'], 2)}%" if 'cpoe' in player_stats and player_stats['cpoe'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [epa_str, cpoe_str, vol_str]))
-                        if display_parts:
-                            st.write(f"**{player_name_display}** ({" | ".join(display_parts)})")
-                            show_advanced_stats = True
-                    elif position == 'RB' and ('ryoe' in player_stats or 'rz_touches' in player_stats):
-                        ryoe_str = f"RYOE: {round(player_stats['ryoe'], 1)}" if 'ryoe' in player_stats and player_stats['ryoe'] is not None else ""
-                        rz_str = f"RZ: {player_stats['rz_touches']:.0f}" if 'rz_touches' in player_stats and player_stats['rz_touches'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [ryoe_str, rz_str, vol_str]))
-                        if display_parts:
-                            st.write(f"**{player_name_display}** ({" | ".join(display_parts)})")
-                            show_advanced_stats = True
-                    elif position in ['WR', 'TE'] and ('wopr_proxy' in player_stats or 'pbp_epa' in player_stats or 'avg_separation' in player_stats):
-                        wopr_str = f"WOPR: {round(player_stats['wopr_proxy'], 2)}" if 'wopr_proxy' in player_stats and player_stats['wopr_proxy'] is not None else ""
-                        epa_str = f"EPA: {round(player_stats['pbp_epa'], 2)}" if 'pbp_epa' in player_stats and player_stats['pbp_epa'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [wopr_str, epa_str, vol_str]))
-                        if display_parts:
-                            st.write(f"**{player_name_display}** ({" | ".join(display_parts)})")
-                            show_advanced_stats = True
-                    
-                    if not show_advanced_stats: # Fallback to old format if advanced stats not displayed
-                        actual_pts_display = f":green[{actual_pts:.1f}]" if actual_pts > avg_pts_val else f"{actual_pts:.1f}"
-                        st.write(f"**{player_name_display}** (Vol: {volume_val:.1f} | Avg: {avg_pts_val:.1f} | Act: {actual_pts_display})")
-
-                # Calculate and display bench players for Team B
-                st.markdown("<!-- -->") # Divider
-                st.write("**Bench:**")
-                team_b_roster = next((r['players'] for r in rosters_data if r['roster_id'] == roster_b_id), [])
-                team_b_bench_players = [p_id for p_id in team_b_roster if p_id not in team_b['starters']]
-                for player_id in team_b_bench_players:
-                    clean_id = str(player_id).replace('.0', '')
-                    player_stats = merged_player_stats.get(clean_id, {'vol': 0, 'avg_pts': 0, 'pass': 0, 'rush': 0, 'epa': 0, 'cpoe': 0, 'air_yards': 0, 'ryoe': 0, 'rz_touches': 0, 'wopr_proxy': 0, 'pbp_epa': 0, 'avg_separation': 0})
-                    volume_val = player_stats['vol']
-                    avg_pts_val = player_stats['avg_pts']
-                    actual_pts = team_b['players_points'].get(player_id, 0)
-                    position = player_positions.get(clean_id, 'UNK')
-
-                    player_name_display = player_id_to_name.get(player_id, f'Player {player_id}')
-
-                    show_advanced_stats_bench = False
-                    if position == 'QB' and ('epa' in player_stats or 'cpoe' in player_stats or 'air_yards' in player_stats):
-                        epa_str = f"EPA: {round(player_stats['epa'], 2)}" if 'epa' in player_stats and player_stats['epa'] is not None else ""
-                        cpoe_str = f"CPOE: {round(player_stats['cpoe'], 2)}%" if 'cpoe' in player_stats and player_stats['cpoe'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [epa_str, cpoe_str, vol_str]))
-                        if display_parts:
-                            st.markdown(f"<small>**{player_name_display}** ({" | ".join(display_parts)})</small>", unsafe_allow_html=True)
-                            show_advanced_stats_bench = True
-                    elif position == 'RB' and ('ryoe' in player_stats or 'rz_touches' in player_stats):
-                        ryoe_str = f"RYOE: {round(player_stats['ryoe'], 1)}" if 'ryoe' in player_stats and player_stats['ryoe'] is not None else ""
-                        rz_str = f"RZ: {player_stats['rz_touches']:.0f}" if 'rz_touches' in player_stats and player_stats['rz_touches'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [ryoe_str, rz_str, vol_str]))
-                        if display_parts:
-                            st.markdown(f"<small>**{player_name_display}** ({" | ".join(display_parts)})</small>", unsafe_allow_html=True)
-                            show_advanced_stats_bench = True
-                    elif position in ['WR', 'TE'] and ('wopr_proxy' in player_stats or 'pbp_epa' in player_stats or 'avg_separation' in player_stats):
-                        wopr_str = f"WOPR: {round(player_stats['wopr_proxy'], 2)}" if 'wopr_proxy' in player_stats and player_stats['wopr_proxy'] is not None else ""
-                        epa_str = f"EPA: {round(player_stats['pbp_epa'], 2)}" if 'pbp_epa' in player_stats and player_stats['pbp_epa'] is not None else ""
-                        vol_str = f"Vol: {player_stats['vol']:.0f}" if 'vol' in player_stats and player_stats['vol'] is not None else ""
-                        display_parts = list(filter(None, [wopr_str, epa_str, vol_str]))
-                        if display_parts:
-                            st.markdown(f"<small>**{player_name_display}** ({" | ".join(display_parts)})</small>", unsafe_allow_html=True)
-                            show_advanced_stats_bench = True
-                    
-                    if not show_advanced_stats_bench: # Fallback to old format if advanced stats not displayed
-                        st.markdown(f"<small>**{player_id_to_name.get(player_id, f'Player {player_id}')}** (Vol: {volume_val:.1f} | Avg: {avg_pts_val:.1f} | Act: {actual_pts:.1f})</small>", unsafe_allow_html=True)
-
-            # AI Analysis Button
-            analyze_button_key = f"analyze_button_{matchup_id}"
-            if st.button(f"Analyze {manager_a_name} vs {manager_b_name}", key=analyze_button_key):
-                if google_api_key:
-                    genai.configure(api_key=google_api_key)
-                    model = genai.GenerativeModel("gemini-2.5-flash")
-
-                    current_date = datetime.date.today().strftime('%B %d, %Y')
-
-                    team_a_analysis_str = []
-                    for player_id in team_a['starters']:
-                        clean_id = str(player_id).replace('.0', '')
-                        player_stats = merged_player_stats.get(clean_id, {'vol': 0, 'avg_pts': 0, 'pass': 0, 'rush': 0, 'epa': 0, 'cpoe': 0, 'air_yards': 0, 'ryoe': 0, 'rz_touches': 0, 'wopr_proxy': 0, 'pbp_epa': 0, 'avg_separation': 0})
-                        volume_val = player_stats['vol']
-                        avg_pts_val = player_stats['avg_pts']
-                        actual_pts = team_a['players_points'].get(player_id, 0)
-                        position = player_positions.get(clean_id, 'UNK')
+                    for pid in p_ids:
+                        pid = str(pid).replace('.0', '')
+                        stats = master_stats.get(pid, {})
                         
-                        player_analysis_string = f"{player_id_to_name.get(player_id, f'Player {player_id}')} (Vol: {volume_val:.1f}, Avg: {avg_pts_val:.1f}, Act: {actual_pts:.1f})"
+                        # Defense Lookup
+                        if not stats:
+                            p_info = all_players.get(pid, {})
+                            if p_info.get('position') == 'DEF':
+                                abbr = p_info.get('team')
+                                stats = master_stats.get(abbr, {})
+                                if not stats and abbr == 'JAX': stats = master_stats.get('JAC', {})
 
-                        # Add advanced stats to AI prompt string
-                        advanced_stats_parts = []
-                        if position == 'QB':
-                            if 'epa' in player_stats and player_stats['epa'] is not None: advanced_stats_parts.append(f"EPA: {player_stats['epa']:.2f}")
-                            if 'cpoe' in player_stats and player_stats['cpoe'] is not None: advanced_stats_parts.append(f"CPOE: {player_stats['cpoe']:.2f}")
-                            if 'air_yards' in player_stats and player_stats['air_yards'] is not None: advanced_stats_parts.append(f"AirYds: {player_stats['air_yards']:.0f}")
-                        elif position == 'RB':
-                            if 'ryoe' in player_stats and player_stats['ryoe'] is not None: advanced_stats_parts.append(f"RYOE: {player_stats['ryoe']:.1f}")
-                            if 'rz_touches' in player_stats and player_stats['rz_touches'] is not None: advanced_stats_parts.append(f"RZ Touches: {player_stats['rz_touches']:.0f}")
-                        elif position in ['WR', 'TE']:
-                            if 'wopr_proxy' in player_stats and player_stats['wopr_proxy'] is not None: advanced_stats_parts.append(f"WOPR: {player_stats['wopr_proxy']:.2f}")
-                            if 'pbp_epa' in player_stats and player_stats['pbp_epa'] is not None: advanced_stats_parts.append(f"EPA: {player_stats['pbp_epa']:.2f}")
-                            if 'avg_separation' in player_stats and player_stats['avg_separation'] is not None: advanced_stats_parts.append(f"Avg Sep: {player_stats['avg_separation']:.1f}")
+                        vol = stats.get('vol', 0)
+                        avg = stats.get('avg_pts', 0)
+                        act = team['players_points'].get(pid, 0)
+                        pos = stats.get('position', all_players.get(pid, {}).get('position', 'UNK'))
+                        name = all_players.get(pid, {}).get('full_name', f'Player {pid}')
 
-                        if advanced_stats_parts:
-                            player_analysis_string += f" ({', '.join(advanced_stats_parts)})"
+                        metrics = []
+                        if pos == 'QB':
+                            if 'epa' in stats: metrics.append(f"EPA: {stats['epa']:.2f}")
+                            if 'cpoe' in stats: metrics.append(f"CPOE: {stats['cpoe']:.1f}%")
+                        elif pos == 'RB':
+                            if 'ryoe' in stats: metrics.append(f"RYOE: {stats['ryoe']:.1f}")
+                            if 'rz_touches' in stats: metrics.append(f"RZ: {stats['rz_touches']:.0f}")
+                        elif pos in ['WR', 'TE']:
+                            if 'wopr_proxy' in stats: metrics.append(f"WOPR: {stats['wopr_proxy']:.1f}")
+                            if 'avg_sep' in stats: metrics.append(f"Sep: {stats['avg_sep']:.1f}")
+                        elif pos == 'DEF':
+                            if 'epa_allowed' in stats: metrics.append(f"EPA All: {stats['epa_allowed']:.2f}")
+                            if 'sack_rate' in stats: metrics.append(f"Sack%: {stats['sack_rate']*100:.1f}%")
+                        elif pos == 'K':
+                            if 'longest_fg_made' in stats: metrics.append(f"Long: {stats['longest_fg_made']:.0f}")
+                            if 'fg_percentage' in stats: metrics.append(f"FG%: {stats['fg_percentage']:.0f}%")
 
-                        team_a_analysis_str.append(player_analysis_string)
+                        metrics.append(f"Vol: {vol:.0f}")
+                        metric_str = " | ".join(metrics)
+                        act_fmt = f":green[{act:.1f}]" if act > avg else f"{act:.1f}"
+                        line = f"**{name}** ({metric_str} | Avg: {avg:.1f} | Act: {act_fmt})"
+                        
+                        if grp == "Bench": st.caption(line)
+                        else: 
+                            st.write(line)
+                            team_text += f"{name} ({pos}): {metric_str}, Act: {act}\n"
+                
+                prompt_data.append(team_text)
 
-                    team_b_analysis_str = []
-                    for player_id in team_b['starters']:
-                        clean_id = str(player_id).replace('.0', '')
-                        player_stats = merged_player_stats.get(clean_id, {'vol': 0, 'avg_pts': 0, 'pass': 0, 'rush': 0, 'epa': 0, 'cpoe': 0, 'air_yards': 0, 'ryoe': 0, 'rz_touches': 0, 'wopr_proxy': 0, 'pbp_epa': 0, 'avg_separation': 0})
-                        volume_val = player_stats['vol']
-                        avg_pts_val = player_stats['avg_pts']
-                        actual_pts = team_b['players_points'].get(player_id, 0)
-                        position = player_positions.get(clean_id, 'UNK')
-
-                        player_analysis_string = f"{player_id_to_name.get(player_id, f'Player {player_id}')} (Vol: {volume_val:.1f}, Avg: {avg_pts_val:.1f}, Act: {actual_pts:.1f})"
-
-                        # Add advanced stats to AI prompt string
-                        advanced_stats_parts = []
-                        if position == 'QB':
-                            if 'epa' in player_stats and player_stats['epa'] is not None: advanced_stats_parts.append(f"EPA: {player_stats['epa']:.2f}")
-                            if 'cpoe' in player_stats and player_stats['cpoe'] is not None: advanced_stats_parts.append(f"CPOE: {player_stats['cpoe']:.2f}")
-                            if 'air_yards' in player_stats and player_stats['air_yards'] is not None: advanced_stats_parts.append(f"AirYds: {player_stats['air_yards']:.0f}")
-                        elif position == 'RB':
-                            if 'ryoe' in player_stats and player_stats['ryoe'] is not None: advanced_stats_parts.append(f"RYOE: {player_stats['ryoe']:.1f}")
-                            if 'rz_touches' in player_stats and player_stats['rz_touches'] is not None: advanced_stats_parts.append(f"RZ Touches: {player_stats['rz_touches']:.0f}")
-                        elif position in ['WR', 'TE']:
-                            if 'wopr_proxy' in player_stats and player_stats['wopr_proxy'] is not None: advanced_stats_parts.append(f"WOPR: {player_stats['wopr_proxy']:.2f}")
-                            if 'pbp_epa' in player_stats and player_stats['pbp_epa'] is not None: advanced_stats_parts.append(f"EPA: {player_stats['pbp_epa']:.2f}")
-                            if 'avg_separation' in player_stats and player_stats['avg_separation'] is not None: advanced_stats_parts.append(f"Avg Sep: {player_stats['avg_separation']:.1f}")
-
-                        if advanced_stats_parts:
-                            player_analysis_string += f" ({', '.join(advanced_stats_parts)})"
-
-                        team_b_analysis_str.append(player_analysis_string)
-
-                    # Determine available advanced metrics for the prompt
-                    available_advanced_metrics = []
-                    if st.session_state.data_health.get('NFL Play-by-Play') == '✅ Online':
-                        available_advanced_metrics.append("EPA")
-                        available_advanced_metrics.append("RZ Touches") # From PBP
-                        available_advanced_metrics.append("WOPR_Proxy") # From PBP
-                    if st.session_state.data_health.get('Next Gen Stats') == '✅ Online':
-                        if "CPOE" not in available_advanced_metrics: available_advanced_metrics.append("CPOE")
-                        if "RYOE" not in available_advanced_metrics: available_advanced_metrics.append("RYOE")
-                        if "Avg Separation" not in available_advanced_metrics: available_advanced_metrics.append("Avg Separation")
-
-                    prompt_advanced_metrics_str = ", and advanced metrics like " + ", ".join(available_advanced_metrics) + "." if available_advanced_metrics else "."
-
-                    # Construct prompt advanced logic based on available data
-                    prompt_advanced_logic = []
-                    if 'WOPR_Proxy' in available_advanced_metrics: prompt_advanced_logic.append("Use WOPR for WRs to judge volume.")
-                    if 'EPA' in available_advanced_metrics: prompt_advanced_logic.append("Use EPA for QBs and WR/TEs to judge efficiency.")
-                    if 'CPOE' in available_advanced_metrics: prompt_advanced_logic.append("Use CPOE for QBs to judge accuracy.")
-                    if 'RYOE' in available_advanced_metrics: prompt_advanced_logic.append("Use RYOE for RBs to judge running back talent independent of blocking.")
-                    if 'RZ Touches' in available_advanced_metrics: prompt_advanced_logic.append("Use RZ Touches for RBs to judge touchdown upside.")
-                    if 'Avg Separation' in available_advanced_metrics: prompt_advanced_logic.append("Use Avg Separation for WRs to judge route running and ability to get open.")
-
-                    full_prompt_advanced_logic = "\n".join(prompt_advanced_logic)
-
-                    prompt_intro = f"Act as a data-driven fantasy expert. Today is {current_date}. We are in the 2025 NFL Season. I will give you two rosters with their Volume (Vol), 3-Week Average (Avg), and Current Score (Act){prompt_advanced_metrics_str}"
-
-                    prompt_context = """
-CRITICAL CONTEXT: If a player has Actual Score (Act) of 0 (or near 0), assume their game has NOT started yet. Do NOT call them "unlucky" or a "bust". Simply ignore them or mention they are yet to play. Only use terms like "unlucky" if Act is low but Vol is high AND the game seems finished. Logic:\nHigh Vol + Low Act = "Unlucky / Buy Low"\nLow Vol + High Act = "Lucky / Sell High"
-"""
-
-                    prompt_analysis_rules = f"{full_prompt_advanced_logic}\nCompare the two teams based on these metrics. Keep the analysis punchy and under 100 words."
+        if st.button("Analyze Matchup", key=mid):
+            if google_api_key:
+                try:
+                    model = genai.GenerativeModel("gemini-2.5-flash")
+                    prompt = f"""Analyze this Week {curr_week} fantasy matchup. 
                     
-                    # Fix: Join the lists into variables outside the f-string
-                    team_a_text = "\n".join(team_a_analysis_str)
-                    team_b_text = "\n".join(team_b_analysis_str)
-                    prompt_teams_data = f"Team A (Starters: {team_a_text})\nTeam B (Starters: {team_b_text})"
+CRITICAL RULES:
+1. If a player has 0.0 Actual Points (Act), their game has NOT started yet. Do NOT call them 'unlucky' or a 'bust'. IGNORE their lack of points in your winner prediction.
+2. Limit your response to UNDER 150 words. Be punchy and concise.
+3. Structure your response with ONLY these two sections:
+   - Winner Prediction: (Pick one team and explain why in 2-3 sentences)
+   - Key Mismatch: (Identify the biggest advantage one team has in 1-2 sentences)
 
-                    prompt = f"{prompt_intro}\n{prompt_context}\n{prompt_analysis_rules}\n\n{prompt_teams_data}"
+Focus on volume (Vol) and efficiency stats (EPA, WOPR, CPOE, RYOE).
 
-                    try:
-                        response = model.generate_content(prompt)
-                        st.success(response.text)
-                    except Exception as e:
-                        st.error(f"Error generating analysis: {e}")
-                else:
-                    st.warning("Please enter your Google API Key in the sidebar to get AI analysis.")
+{prompt_data[0]} 
 
-else:
-    st.write("Please enter a League ID in the sidebar.")
+VS 
 
-    # Display the system status in the placeholder at the end of the script for 'Instant Feedback' Fix
-    with status_placeholder.container():
-        with st.sidebar.expander("🔌 System Status", expanded=True):
-            for source, status in st.session_state.data_health.items():
-                st.write(f"{source}: {status}")
+{prompt_data[1]}"""
+                    resp = model.generate_content(prompt)
+                    st.success(resp.text)
+                    save_prediction(curr_week, mid, user_map.get(roster_owner_map.get(teams[0]['roster_id'])), user_map.get(roster_owner_map.get(teams[1]['roster_id'])), resp.text)
+                    st.toast("Saved to History!")
+                except Exception as e:
+                    st.error(f"AI Error: {e}")
+
+with st.expander("📜 History"):
+    try:
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            df = pd.read_sql("SELECT * FROM predictions ORDER BY id DESC LIMIT 5", conn)
+            st.dataframe(df)
+    except: st.write("No history yet.")
+
+with status_placeholder.container():
+    with st.sidebar.expander("System Status", expanded=True):
+        for k, v in st.session_state.data_health.items():
+            st.write(f"{k}: {v}")
